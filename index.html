@@ -542,30 +542,6 @@
       font-weight: 700;
     }
 
-    .matrix {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .prep {
-      padding: 18px;
-      border-left: 4px solid var(--blue);
-      background: var(--paper-soft);
-      border-radius: 8px;
-    }
-
-    .prep h3 {
-      margin: 0 0 8px;
-      font-size: 21px;
-    }
-
-    .prep p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 14px;
-    }
-
     .footer {
       margin-top: 58px;
       padding-top: 24px;
@@ -609,8 +585,7 @@
         justify-content: flex-start;
       }
 
-      .cards,
-      .matrix {
+      .cards {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
@@ -649,8 +624,7 @@
       }
 
       .stat-grid,
-      .cards,
-      .matrix {
+      .cards {
         grid-template-columns: 1fr;
       }
 
@@ -725,22 +699,6 @@
         </div>
       </aside>
     </header>
-
-    <section class="section">
-      <div class="section-head">
-        <p class="section-num">00 · Readiness</p>
-        <div>
-          <h2 class="section-title">发布前要先讲清楚三件事</h2>
-          <p class="section-lede">用户来到 GitHub 后，需要先判断这个仓库解决什么问题、自己该用哪个 skill、每个 skill 的输入输出和质量边界是什么。导航页负责快速浏览，README 和 docs 负责深入说明。</p>
-        </div>
-      </div>
-      <div class="matrix">
-        <div class="prep"><h3>定位</h3><p>说明 GEO 是 Generative Engine Optimization，仓库不是零散 prompt，而是可复用 skill 包。</p></div>
-        <div class="prep"><h3>选择</h3><p>按战略、页面、内容、知识、监测、运营、研究分类，让用户知道该调用哪一个。</p></div>
-        <div class="prep"><h3>使用</h3><p>每个 skill 都要有触发场景、必要输入、默认输出、示例和相邻边界。</p></div>
-        <div class="prep"><h3>信任</h3><p>公开 eval、示例、质量门和开源安全规则，避免用户把未完成包当成稳定能力。</p></div>
-      </div>
-    </section>
 
     <section class="section" id="catalog">
       <div class="section-head">
