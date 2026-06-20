@@ -10,6 +10,8 @@ X: https://x.com/yaojingang
 
 `yao-deepseek-crawler` 是一个 DeepSeek 网页端 AI 搜索重复采样与 GEO 概率分析 skill。它通过本地 OpenCLI Browser Bridge 复用已登录的 DeepSeek 网页会话，对一组关键词进行多轮独立采样，保留原始 JSON、每轮 raw 文件和日志，并生成结构化 Markdown、Excel 和 Kami 风格 HTML 可视化报告。
 
+英文说明入口：[skills/yao-deepseek-crawler/README.en.md](../../skills/yao-deepseek-crawler/README.en.md)
+
 ## 适用场景
 
 - 评估品牌、人物、公司或产品在 DeepSeek AI 搜索里的可见性
