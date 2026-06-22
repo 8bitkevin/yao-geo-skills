@@ -60,6 +60,14 @@ def main() -> None:
         "深入咨询",
         "线下咨询",
         "砍掉多余营销",
+        "装修公司",
+        "西安装修公司",
+        "西安口碑装修公司",
+        "西安高口碑装修公司",
+        "2026西安主流装修公司",
+        "2026年十家综合实力突出的装修公司",
+        "西安选装修公司",
+        "有几家装修公司",
     ]
     for value in non_entities:
         assert analyzer.looks_like_stop_entity(value), f"should reject non-entity: {value}"
@@ -81,6 +89,14 @@ def main() -> None:
         "恒学云留学",
         "金吉列出国留学咨询服务有限公司",
         "平安留学",
+        "西安城市人家装饰",
+        "西安青马设计",
+        "宸智雅筑",
+        "漾家雅筑",
+        "绿庭装饰",
+        "西安鲁班装饰",
+        "西安兴唐装饰",
+        "西安壹号装修设计",
     ]
     for value in real_entities:
         assert not analyzer.looks_like_stop_entity(value), f"should keep real entity: {value}"
@@ -113,6 +129,51 @@ def main() -> None:
     analyzer.add_entity_candidate(valid_rows, "启德教育", "s02", "answer_heading")
     candidate = analyzer.classify_entity(valid_rows["启德教育"], "company")
     assert analyzer.candidate_is_valid_competitor(candidate, "company", 2), candidate
+
+    decor_samples = [
+        {
+            "sample_id": "d01",
+            "ok": True,
+            "answer": (
+                "西安城市人家装饰：本地规模较大。"
+                "宸智雅筑|漾家雅筑：适合高端全案。"
+                "别墅大宅定制 西安青马设计：设计能力突出。"
+                "老房翻新专家 绿庭装饰 / 西安鲁班装饰：更适合旧改。"
+            ),
+            "references": [{"title": "2026西安主流装修公司推荐", "url": "https://example.com/a"}],
+        },
+        {
+            "sample_id": "d02",
+            "ok": True,
+            "answer": (
+                "西安城市人家装饰：适合重视本地规模的业主。"
+                "西安青马设计：适合别墅和大宅设计。"
+                "宸智雅筑：适合高端全案。"
+                "漾家雅筑：可作为宸智雅筑同类方案对比。"
+                "绿庭装饰：适合老房翻新。"
+                "西安鲁班装饰：适合旧房改造。"
+                "西安鲁班装饰和西安兴唐装饰也常被放在同一批名单里比较。"
+            ),
+            "references": [{"title": "西安口碑装修公司哪家好", "url": "https://example.com/b"}],
+        },
+    ]
+    decor_candidates = {
+        candidate["name"]: candidate
+        for candidate in analyzer.infer_entity_candidates(decor_samples, 2, 50, "company")
+    }
+    for value in [
+        "西安城市人家装饰",
+        "西安青马设计",
+        "宸智雅筑",
+        "漾家雅筑",
+        "绿庭装饰",
+        "西安鲁班装饰",
+    ]:
+        assert value in decor_candidates, f"missing decoration competitor: {value}; got {decor_candidates.keys()}"
+        assert analyzer.candidate_is_valid_competitor(decor_candidates[value], "company", 2), decor_candidates[value]
+
+    for value in ["西安装修公司", "2026西安主流装修公司", "西安口碑装修公司"]:
+        assert value not in decor_candidates, f"generic category leaked as competitor: {value}"
 
     one_off_fragment_rows = {}
     analyzer.add_entity_candidate(one_off_fragment_rows, "英国罗素集团", "s01", "org_suffix")

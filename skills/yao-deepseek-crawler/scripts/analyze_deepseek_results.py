@@ -51,6 +51,13 @@ STOP_ENTITIES = {
     "平台",
     "服务商",
     "品牌",
+    "装修",
+    "装饰",
+    "设计",
+    "家装",
+    "工装",
+    "整装",
+    "装潢",
     "留学",
     "教育",
     "咨询",
@@ -85,6 +92,7 @@ STRONG_ENTITY_CONTEXT_PREFIX_RE = re.compile(
     r"^(?:"
     r"如果|那么|并且|而且|同时|因此|所以|但是|"
     r"可以重点考察像|可以重点考察|重点考察|可以询问|直接询问|"
+    r"可以对比|建议对比|优先对比|对比|"
     r"例如|比如|以及|目前|代表人物|专家|老师|推荐|关注|选择|在像"
     r")"
 )
@@ -113,6 +121,7 @@ ENTITY_ATTRIBUTE_PATTERNS = [
     r"^(?:头部|大型|知名|老牌|传统|正规|本地|当地|全国性|综合性|高端|专业|全链条|一站式){1,4}(?:教育|留学|咨询|服务)?(?:公司|企业|集团|机构|平台|服务商)$",
     r"^(?:头部|大型|知名|老牌|传统|正规|本地|当地|全国性|综合性|高端|专业|全链条)(?:教育|留学|咨询|服务)?(?:公司|企业|集团|机构|平台|服务商)$",
     r"^(?:教育|留学|咨询|服务|中介|培训)(?:公司|企业|集团|机构|平台|服务商)$",
+    r"^(?:装修|装饰|家装|工装|整装|设计)(?:公司|企业|集团|机构|平台|服务商|品牌)$",
     r"^(?:A股|港股|美股|H股|上市|国有|民营|外资|合资|连锁|大型|头部|知名|老牌|传统|正规|高端|专业|全链条)(?:教育|留学|咨询|服务)?(?:集团|公司|企业|机构)$",
     r"^(?:教育部|工信部|商务部|民政部|市场监管总局|国家|官方|政府|行业|协会|权威)?(?:首批|首家|唯一|指定|认证|认可|备案|批准|授权|资质|合规|正规|持牌|牌照|许可|监管|推荐|示范|试点|重点|白名单).{0,10}(?:机构|公司|企业|集团|平台|服务商|品牌|单位)$",
     r"^.{0,16}(?:首批|首家|唯一|指定|认证|认可|备案|批准|授权|资质|合规|正规|持牌|牌照|许可|监管|推荐|示范|试点|重点|白名单).{0,8}(?:机构|公司|企业|集团|平台|服务商|品牌|单位)$",
@@ -144,11 +153,13 @@ PERSON_ROLE_WORDS = (
 )
 
 ORG_SUFFIX_WORDS = (
-    "公司|科技|集团|研究院|研究所|实验室|大学|学院|中心|平台|服务商|机构|传媒|教育|留学|智能|数据|AI"
+    "有限责任公司|股份有限公司|有限公司|装修工程|装修设计|室内设计|空间设计|装饰|设计|雅筑|"
+    "家装|整装|装潢|公司|科技|集团|研究院|研究所|实验室|大学|学院|中心|平台|服务商|机构|传媒|教育|留学|智能|数据|AI"
 )
 
 COMPANY_SUFFIX_WORDS = (
-    "公司|科技|集团|研究院|研究所|实验室|大学|学院|中心|服务商|机构|传媒|教育|留学"
+    "有限责任公司|股份有限公司|有限公司|装修工程|装修设计|室内设计|空间设计|装饰|设计|雅筑|"
+    "家装|整装|装潢|公司|科技|集团|研究院|研究所|实验室|大学|学院|中心|服务商|机构|传媒|教育|留学"
 )
 
 PRODUCT_SUFFIX_WORDS = (
@@ -158,6 +169,8 @@ PRODUCT_SUFFIX_WORDS = (
 STRONG_COMPANY_SUFFIX_RE = re.compile(
     r"(?:有限责任公司|股份有限公司|有限公司|公司|集团|大学|学院|研究院|研究所|实验室|中心|科技|传媒)$"
 )
+
+HOME_ORG_SUFFIX_RE = re.compile(r"(?:装修工程|装修设计|室内设计|空间设计|装饰|设计|雅筑|家装|整装|装潢)$")
 
 REPORT_ITEM_LIMIT = 10
 
@@ -786,9 +799,73 @@ def infer_brand_rows(samples: list[dict], min_count: int, limit: int) -> list[li
     return rows
 
 
+def looks_like_home_improvement_attribute(value: str) -> bool:
+    cleaned = clean_text(value).strip("：:,.，。()（）[]【】")
+    if not cleaned:
+        return True
+    if re.fullmatch(r"(?:装修|装饰|设计|家装|工装|整装|装潢)(?:公司|企业|集团|机构|平台|服务商|品牌)?", cleaned):
+        return True
+    match = re.search(r"(?:装修公司|装饰公司|家装公司|工装公司|装修机构|装修品牌|装修服务商|装修)$", cleaned)
+    if not match:
+        return False
+    stem = cleaned[: match.start()]
+    stem = re.sub(r"^(?:19|20)\d{2}(?:年)?", "", stem)
+    generic_token_re = re.compile(
+        r"(?:西安|北京|上海|广州|深圳|成都|杭州|南京|武汉|重庆|天津|苏州|全国|国内|本地|当地|"
+        r"主流|高口碑|口碑|靠谱|专业|正规|高端|老牌|大型|知名|热门|优质|推荐|排名|排行|榜单|"
+        r"测评|评测|对比|避坑|指南|攻略|十大|十家|几家|多家|有几家|哪些|哪家|哪个|怎么选|如何选|"
+        r"找|选|选择|毛坯房|老房|旧房|新房|二手房|别墅|大宅|全包|半包|性价比|综合|实力|突出|"
+        r"突出的|综合实力|综合实力突出|放心|值得|又现|装修|装饰|家装|工装|设计|公司|机构|品牌|的)"
+    )
+    remainder = generic_token_re.sub("", stem)
+    remainder = re.sub(r"[\d\s\-_/|、，,：:；;·.]+", "", remainder)
+    return not remainder
+
+
+def weak_home_org_prefix_is_clean(name: str) -> bool:
+    cleaned = normalize_entity_name(name)
+    suffix_match = HOME_ORG_SUFFIX_RE.search(cleaned)
+    if not suffix_match:
+        return True
+    prefix = cleaned[: suffix_match.start()]
+    prefix_core = re.sub(r"^(?:西安|北京|上海|广州|深圳|成都|杭州|南京|武汉|重庆|天津|苏州)", "", prefix)
+    if len(prefix_core) < 2 or len(prefix_core) > 10:
+        return False
+    if re.search(r"[\s/|、，,：:；;·.]", prefix_core):
+        return False
+    return not bool(
+        re.search(
+            r"(?:推荐|排名|排行|榜单|哪家|哪个|几家|多家|找|选|选择|主流|口碑|靠谱|专业|正规|"
+            r"高端|本地|当地|装修|装饰|设计|家装|工装|毛坯|老房|旧房|新房|别墅|大宅|"
+            r"全案|舒适化|主创|顶级|追求|警惕|定制|专家|实力|综合|资金|安全|性价比|"
+            r"付款|节点|施工|避坑|指南|攻略|对比|测评|评测)",
+            prefix_core,
+        )
+    )
+
+
+def split_compound_entity_names(value: str) -> list[str]:
+    normalized = normalize_entity_name(value)
+    if not normalized:
+        return []
+    parts = [normalize_entity_name(part) for part in re.split(r"(?:[/|、，,；;]|以及|和|与|及)", normalized)]
+    valid_parts = [
+        part
+        for part in parts
+        if part
+        and re.search(f"(?:{ORG_SUFFIX_WORDS}|{PRODUCT_SUFFIX_WORDS})$", part)
+        and not looks_like_stop_entity(part)
+    ]
+    if len(valid_parts) >= 2:
+        return valid_parts
+    return [normalized]
+
+
 def looks_like_stop_entity(value: str) -> bool:
     cleaned = clean_text(value).strip("：:,.，。()（）[]【】")
     if cleaned in STOP_ENTITIES:
+        return True
+    if looks_like_home_improvement_attribute(cleaned):
         return True
     if looks_like_entity_attribute(cleaned):
         return True
@@ -828,6 +905,8 @@ def looks_like_stop_entity(value: str) -> bool:
 def looks_like_entity_attribute(value: str) -> bool:
     cleaned = normalize_entity_name(value)
     if not cleaned:
+        return True
+    if looks_like_home_improvement_attribute(cleaned):
         return True
     for pattern in ENTITY_ATTRIBUTE_PATTERNS:
         if re.fullmatch(pattern, cleaned, flags=re.IGNORECASE):
@@ -928,7 +1007,11 @@ def entity_surface_score(value: str, target_kind: str) -> tuple[int, list[str]]:
         return 0, ["属性、泛称或噪声短语"]
     score = 1
     if target_kind in {"company", "brand", "mixed"}:
-        if STRONG_COMPANY_SUFFIX_RE.search(name):
+        if HOME_ORG_SUFFIX_RE.search(name):
+            if weak_home_org_prefix_is_clean(name):
+                score = max(score, 4)
+                reasons.append("行业组织后缀")
+        elif STRONG_COMPANY_SUFFIX_RE.search(name):
             score = max(score, 5)
             reasons.append("强组织后缀")
         elif re.search(r"(?:机构|平台|服务商)$", name) and not looks_like_entity_fragment(name):
@@ -953,6 +1036,8 @@ def looks_like_org_entity(value: str) -> bool:
     name = normalize_entity_name(value)
     if looks_like_stop_entity(name):
         return False
+    if HOME_ORG_SUFFIX_RE.search(name):
+        return weak_home_org_prefix_is_clean(name)
     if re.search(r"(?:教育|留学)$", name):
         if not weak_org_prefix_is_clean(name):
             return False
@@ -1039,7 +1124,8 @@ def collect_entity_rows(samples: list[dict]) -> dict[str, dict]:
                 if looks_like_chinese_person_name(match.group(1)):
                     add_entity_candidate(rows, match.group(1), sid, "person_alias", match.group(2))
             for match in re.finditer(rf"([\u4e00-\u9fa5A-Za-z0-9]{{2,24}}(?:{org_suffix}))", line):
-                add_entity_candidate(rows, match.group(1), sid, "org_suffix")
+                for entity_name in split_compound_entity_names(match.group(1)):
+                    add_entity_candidate(rows, entity_name, sid, "org_suffix")
             for match in re.finditer(r"[A-Z][A-Za-z0-9&.\- ]{1,28}(?:AI|GEO|SEO|Tech|Data|Cloud|Labs|Group|Inc|Co)", line):
                 add_entity_candidate(rows, match.group(0), sid, "english_brand_like")
 
@@ -1050,7 +1136,8 @@ def collect_entity_rows(samples: list[dict]) -> dict[str, dict]:
             for match in re.finditer(r"([\u4e00-\u9fa5]{2,4})与", title):
                 add_entity_candidate(rows, match.group(1), sid, "source_title_person")
             for match in re.finditer(rf"([\u4e00-\u9fa5A-Za-z0-9]{{2,24}}(?:{org_suffix}))", title):
-                add_entity_candidate(rows, match.group(1), sid, "source_title_org")
+                for entity_name in split_compound_entity_names(match.group(1)):
+                    add_entity_candidate(rows, entity_name, sid, "source_title_org")
     return rows
 
 
