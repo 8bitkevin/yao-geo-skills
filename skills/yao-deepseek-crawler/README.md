@@ -22,6 +22,7 @@
 - OpenCLI Browser Bridge 已连接 Chrome 或 Edge profile
 - DeepSeek 网页端已登录
 - 本地 DeepSeek browser crawler 脚本，默认路径为 `../../SourceCode/opencli-boss-ai/scripts/geo-deepseek-browser-direct.mjs`，也可以通过 `--crawler-script` 指定
+- 可选：`OPENAI_API_KEY`，用于分析阶段的 AI 语义复核；没有密钥时默认自动回退到本地规则
 
 安装和使用细节见：
 
@@ -124,6 +125,7 @@ python3 scripts/analyze_deepseek_results.py \
   --target-aliases "蔚来ES8,蔚来ES6,蔚来EC6,NIO" \
   --entity-type product \
   --brands-file brands.txt \
+  --semantic-review auto \
   --out-dir runs/nio-nev/report
 ```
 
@@ -133,8 +135,19 @@ python3 scripts/analyze_deepseek_results.py \
 - `runs/nio-nev/report/structured-data.md`
 - `runs/nio-nev/report/structured-data.xlsx`
 - `runs/nio-nev/report/report.html`
+- `runs/nio-nev/report/semantic-review-cache.json`（仅当 AI 语义复核产生可缓存结果时写入）
 
 标准报告需要 `--target-entity` 和 `--entity-type`。实体类型支持 `person/人`、`company/公司`、`product/产品`。目标匹配使用“包含 + 别名”逻辑，例如目标实体 `蔚来` 可以合并 `蔚来ES8`、`蔚来ES6`、`NIO` 等别名。短英文别名会按独立 token 匹配，避免误伤更长词。竞品只保留与目标实体同类型的实体。
+
+分析阶段支持可选 AI 语义复核：
+
+- `--semantic-review auto`：默认模式。能调用 AI 时复核候选实体；缺少密钥或调用失败时回退本地规则，并在 `summary.json` 记录 `semantic_review_status: fallback`。
+- `--semantic-review required`：正式交付前建议使用。AI 复核不可用、返回缺项或解析失败时，分析会直接失败。
+- `--semantic-review off`：关闭语义复核，只使用本地规则。
+- `--semantic-confidence-threshold 0.72`：AI 判定为直接竞品时的最低置信度。
+- `--semantic-review-cache <path>`：复核缓存路径，默认在报告目录下写入 `semantic-review-cache.json`。
+
+语义复核只作为增强层，不替代原始日志、正文证据和硬规则。候选项必须同时通过噪声过滤、同类型判断、置信度阈值和正文回答证据，才能进入竞品矩阵。报告和结构化导出会保留 AI 语义标签、是否同类型、是否进入竞品矩阵、置信度、判定理由和被排除原因。
 
 ## 报告能力
 
@@ -143,7 +156,7 @@ HTML 报告默认使用中文简体，并包含英文总结切换入口。报告
 - 报告概览、目录和指标说明
 - 核心结论与目标实体表现
 - 目标实体 vs 同类型竞品对比
-- 情感提及、实体识别和采集覆盖
+- 情感提及、实体识别、AI 语义复核和采集覆盖
 - 概率排名、Top 1 / Top 3 / Top 5、平均排名
 - 渠道分布、来源编号位置、高频来源名、高频域名和高频 URL
 - 标题功能特征、标题长度、时间新旧和标题意图
@@ -191,7 +204,8 @@ python3 scripts/analyze_deepseek_results.py fixtures/sample-deepseek-crawl.json 
 
 - 不处理 DeepSeek 登录、验证码、Cloudflare、人机校验、账号风控或平台限制绕过。
 - 概率指标是重复采样估计，不代表真实市场份额或平台官方排名。
-- 竞品实体识别优先使用用户提供的别名表；自动识别候选仍建议人工复核。
+- 竞品实体识别优先使用用户提供的别名表；自动识别候选仍建议人工复核，正式报告建议开启 `--semantic-review required`。
+- AI 语义复核是可选增强，不会覆盖硬规则、正文证据要求或原始日志审计。
 - 真实抓取会打开浏览器窗口并访问 DeepSeek 网页端，请遵守目标网站规则和账号使用限制。
 
 ## 包结构

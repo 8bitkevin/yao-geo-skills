@@ -22,6 +22,7 @@ It is not a generic website crawler and does not use the DeepSeek API.
 - OpenCLI Browser Bridge connected to a Chrome or Edge profile
 - Logged-in DeepSeek web session
 - Local DeepSeek browser crawler script at `../../SourceCode/opencli-boss-ai/scripts/geo-deepseek-browser-direct.mjs`, or a custom path passed with `--crawler-script`
+- Optional `OPENAI_API_KEY` for analysis-stage AI semantic review. Without it, the default mode falls back to local rules.
 
 Detailed setup guide:
 
@@ -124,6 +125,7 @@ python3 scripts/analyze_deepseek_results.py \
   --target-aliases "蔚来ES8,蔚来ES6,蔚来EC6,NIO" \
   --entity-type product \
   --brands-file brands.txt \
+  --semantic-review auto \
   --out-dir runs/nio-nev/report
 ```
 
@@ -133,8 +135,19 @@ Analysis outputs:
 - `runs/nio-nev/report/structured-data.md`
 - `runs/nio-nev/report/structured-data.xlsx`
 - `runs/nio-nev/report/report.html`
+- `runs/nio-nev/report/semantic-review-cache.json`, written when AI semantic review produces cacheable results
 
 The standard report requires `--target-entity` and `--entity-type`. Entity type accepts `person/人`, `company/公司`, or `product/产品`. Target matching uses contains logic plus aliases, so target `蔚来` can consolidate aliases such as `蔚来ES8`, `蔚来ES6`, and `NIO`. Short Latin aliases are matched as standalone tokens to avoid accidental matches inside longer words. Competitors are limited to the same entity type as the target.
+
+Analysis supports optional AI semantic review:
+
+- `--semantic-review auto`: default mode. Use AI when available; if the API key is missing or the call fails, fall back to local rules and record `semantic_review_status: fallback` in `summary.json`.
+- `--semantic-review required`: recommended before formal delivery. Analysis fails if AI review is unavailable, incomplete, or unparsable.
+- `--semantic-review off`: use local rules only.
+- `--semantic-confidence-threshold 0.72`: minimum confidence for AI-reviewed direct competitors.
+- `--semantic-review-cache <path>`: cache path, defaulting to `semantic-review-cache.json` under the report directory.
+
+Semantic review is an enhancement layer, not a replacement for raw logs, answer-body evidence, or hard rules. A competitor must still pass noise filtering, same-type checks, confidence gates, and answer-body evidence before it enters the competitor matrix. The report and structured exports preserve the AI semantic label, same-type flag, matrix inclusion decision, confidence, reason, and exclusion cause.
 
 ## Report Capabilities
 
@@ -143,7 +156,7 @@ The HTML report defaults to Simplified Chinese and includes an English summary t
 - Overview, table of contents, and metric definitions
 - Core conclusions and target entity performance
 - Target entity vs same-type competitor comparison
-- Sentiment mentions, entity recognition, and crawl coverage
+- Sentiment mentions, entity recognition, AI semantic review, and crawl coverage
 - Probability ranking, Top 1 / Top 3 / Top 5, and average rank
 - Channel distribution, source index position, frequent source names, frequent domains, and frequent URLs
 - Title functional features, title length, freshness, and title intent
@@ -191,7 +204,8 @@ python3 scripts/analyze_deepseek_results.py fixtures/sample-deepseek-crawl.json 
 
 - This skill does not handle DeepSeek login, captchas, Cloudflare, bot checks, account risk control, or platform-limit bypassing.
 - Probability metrics are repeated-sampling estimates, not market share or official platform ranking.
-- Competitor entity recognition should prefer user-reviewed aliases; automatically recognized candidates still require human review.
+- Competitor entity recognition should prefer user-reviewed aliases; automatically recognized candidates still require human review. For formal reports, prefer `--semantic-review required`.
+- AI semantic review is optional and does not override hard rules, answer-body evidence gates, or raw-log auditability.
 - Live crawling opens browser windows and visits DeepSeek web pages. Follow the target website rules and account usage limits.
 
 ## Package Map

@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html
 import json
 import math
+import os
 import re
+import urllib.error
+import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -171,8 +175,47 @@ STRONG_COMPANY_SUFFIX_RE = re.compile(
 )
 
 HOME_ORG_SUFFIX_RE = re.compile(r"(?:装修工程|装修设计|室内设计|空间设计|装饰|设计|雅筑|家装|整装|装潢)$")
+VEHICLE_MODEL_RE = re.compile(r"^[\u4e00-\u9fa5A-Za-z]{1,12}[A-Za-z]{0,3}\d{1,3}(?:\s*[A-Za-z0-9+-]{1,8})?$")
 
 REPORT_ITEM_LIMIT = 10
+
+SEMANTIC_LABELS = {
+    "target_alias",
+    "direct_competitor",
+    "generic_category",
+    "attribute",
+    "service_or_feature",
+    "source_or_title",
+    "unrelated_entity",
+    "uncertain",
+}
+
+SEMANTIC_REVIEW_MODES = {"off", "auto", "required"}
+SEMANTIC_REVIEW_BATCH_SIZE = 24
+
+PRODUCT_BRAND_NOISE = {
+    "智能",
+    "科技",
+    "设计",
+    "国产",
+    "此外",
+    "豪华",
+    "新能源",
+    "高端定位",
+    "增程",
+    "纯电",
+    "插混",
+    "智能科技",
+    "豪华科技",
+    "极简设计",
+    "功能设计",
+}
+
+VEHICLE_GENERIC_PREFIX_RE = re.compile(
+    r"^(?:新能源|豪华|高端|靠谱|推荐|专业|本地|国内|海外|主流|智能|科技|纯电|插混|增程|"
+    r"国产|进口|热门|优质|可靠|安全|长续航|大空间|家用|商务|城市|越野|中大型|大型|中型|"
+    r"小型|紧凑型|中国|美国|德系|日系|哪些|哪个|哪款|这类|此类|一款|多个|主打|值得|适合)+$"
+)
 
 ENTITY_TYPE_ALIASES = {
     "auto": "auto",
@@ -364,6 +407,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-entity-candidates", type=int, default=48)
     parser.add_argument("--max-report-items", type=int, default=REPORT_ITEM_LIMIT)
+    parser.add_argument(
+        "--semantic-review",
+        choices=sorted(SEMANTIC_REVIEW_MODES),
+        default="auto",
+        help="Entity semantic review mode: off, auto, or required. auto falls back to rule-based analysis if no AI key is available.",
+    )
+    parser.add_argument(
+        "--semantic-confidence-threshold",
+        type=float,
+        default=0.72,
+        help="Minimum semantic confidence for AI-reviewed direct competitors.",
+    )
+    parser.add_argument(
+        "--semantic-review-cache",
+        help="Path to semantic review cache JSON. Default: <out-dir>/semantic-review-cache.json",
+    )
     return parser.parse_args()
 
 
@@ -662,7 +721,36 @@ def candidate_evidence_score(candidate: dict) -> float:
     return round(score, 2)
 
 
-def candidate_is_valid_competitor(candidate: dict, target_kind: str, min_count: int) -> bool:
+def required_evidence_score(name: str, target_kind: str, surface_score: float) -> float:
+    normalized = normalize_entity_name(name)
+    if target_kind == "product" and surface_score >= 3 and looks_like_product_brand_entity(normalized):
+        return 1.8
+    return 3.4
+
+
+def semantic_review_is_enforced(candidate: dict) -> bool:
+    semantic = candidate.get("semantic") or {}
+    return bool(semantic.get("enforced"))
+
+
+def semantic_review_allows_competitor(candidate: dict, threshold: float) -> bool:
+    semantic = candidate.get("semantic") or {}
+    if not semantic_review_is_enforced(candidate):
+        return True
+    return (
+        semantic.get("semantic_label") == "direct_competitor"
+        and bool(semantic.get("is_same_type"))
+        and bool(semantic.get("is_direct_competitor"))
+        and float(semantic.get("confidence") or 0) >= threshold
+    )
+
+
+def candidate_is_valid_competitor(
+    candidate: dict,
+    target_kind: str,
+    min_count: int,
+    semantic_confidence_threshold: float = 0.72,
+) -> bool:
     if not candidate.get("is_target"):
         return False
     if candidate.get("kind") not in {"person", "company", "product"}:
@@ -671,13 +759,540 @@ def candidate_is_valid_competitor(candidate: dict, target_kind: str, min_count: 
         return False
     if not candidate_has_answer_evidence(candidate):
         return False
+    if not semantic_review_allows_competitor(candidate, semantic_confidence_threshold):
+        return False
     surface_score = candidate.get("surface_score")
     if surface_score is None:
         surface_score, _ = entity_surface_score(candidate.get("name", ""), target_kind)
     evidence_score = candidate.get("evidence_score")
     if evidence_score is None:
         evidence_score = candidate_evidence_score(candidate)
-    return surface_score >= 3 and evidence_score >= 3.4
+    return surface_score >= 3 and evidence_score >= required_evidence_score(candidate.get("name", ""), target_kind, surface_score)
+
+
+def semantic_cache_key(context: dict) -> str:
+    payload = json.dumps(context, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def read_semantic_cache(path: Path | None) -> dict:
+    if not path or not path.exists():
+        return {"items": {}}
+    try:
+        data = read_json(path)
+        if isinstance(data.get("items"), dict):
+            return data
+    except Exception:
+        pass
+    return {"items": {}}
+
+
+def write_semantic_cache(path: Path | None, cache: dict) -> None:
+    if not path:
+        return
+    cache["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_json(path, cache)
+
+
+def candidate_context_snippets(candidate: dict, samples: list[dict], limit: int = 3) -> list[dict]:
+    aliases = [candidate.get("name", ""), *(candidate.get("aliases") or [])]
+    snippets = []
+    for sample in samples:
+        if not sample.get("ok"):
+            continue
+        answer = sample.get("answer", "")
+        position = find_alias_position(answer, aliases)
+        if position is None:
+            continue
+        snippets.append(
+            {
+                "sample_id": sample.get("sample_id"),
+                "question_id": sample.get("question_id"),
+                "question": sample.get("question"),
+                "snippet": clean_text(answer[max(0, position - 120) : min(len(answer), position + 180)]),
+            }
+        )
+        if len(snippets) >= limit:
+            break
+    return snippets
+
+
+def build_candidate_context(candidate: dict, samples: list[dict], target_profile: dict, target_aliases: list[str]) -> dict:
+    questions = []
+    seen_questions = set()
+    for sample in samples:
+        question = clean_text(sample.get("question"))
+        if question and question not in seen_questions:
+            seen_questions.add(question)
+            questions.append(question)
+    return {
+        "target_entity": target_profile.get("entity") or "",
+        "target_aliases": target_aliases,
+        "target_entity_type": target_profile.get("entity_type") or "mixed",
+        "questions": questions[:12],
+        "candidate": candidate.get("name") or "",
+        "candidate_aliases": candidate.get("aliases") or [],
+        "rule_kind": candidate.get("kind"),
+        "rule_is_same_type": bool(candidate.get("is_target")),
+        "rule_confidence": candidate.get("confidence"),
+        "sample_count": candidate.get("sample_count"),
+        "raw_count": candidate.get("raw_count"),
+        "evidence": candidate.get("evidence") or {},
+        "surface_score": candidate.get("surface_score"),
+        "evidence_score": candidate.get("evidence_score"),
+        "snippets": candidate_context_snippets(candidate, samples),
+    }
+
+
+def clamp_confidence(value: object, default: float = 0.5) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        number = default
+    return round(max(0.0, min(1.0, number)), 3)
+
+
+def semantic_action_for_label(label: str, confidence: float) -> str:
+    if label == "direct_competitor" and confidence >= 0.72:
+        return "include_competitor"
+    if label == "target_alias":
+        return "merge_target_alias"
+    if label == "uncertain":
+        return "manual_review"
+    return "exclude"
+
+
+def normalize_semantic_result(raw: dict, candidate: dict, source: str, enforced: bool) -> dict:
+    label = clean_text(raw.get("semantic_label") or raw.get("label") or "uncertain")
+    if label not in SEMANTIC_LABELS:
+        label = "uncertain"
+    confidence = clamp_confidence(raw.get("confidence"), 0.5)
+    is_same_type = bool(raw.get("is_same_type")) if "is_same_type" in raw else label in {"target_alias", "direct_competitor"}
+    is_direct_competitor = bool(raw.get("is_direct_competitor")) if "is_direct_competitor" in raw else label == "direct_competitor"
+    normalized_name = normalize_entity_name(raw.get("normalized_name") or candidate.get("name") or "")
+    result = {
+        "candidate": candidate.get("name") or normalized_name,
+        "semantic_label": label,
+        "is_same_type": is_same_type,
+        "is_direct_competitor": is_direct_competitor,
+        "confidence": confidence,
+        "reason": clean_text(raw.get("reason") or ""),
+        "normalized_name": normalized_name,
+        "recommended_action": clean_text(raw.get("recommended_action") or semantic_action_for_label(label, confidence)),
+        "source": source,
+        "enforced": enforced,
+    }
+    if not result["reason"]:
+        result["reason"] = "语义复核未返回详细理由。"
+    return result
+
+
+def looks_like_service_or_feature(value: str) -> bool:
+    name = normalize_entity_name(value)
+    return bool(
+        re.fullmatch(r"(?:全案|舒适化|主创|顶级|高端|别墅|大宅|老房|旧房|新房).{0,8}(?:设计|装饰|装修|家装|翻新|改造)", name)
+        or
+        re.search(
+            r"(?:全案|舒适化|主创|顶级|定制|翻新|旧改|施工|节点|付款|设计实力|工程落地|"
+            r"资金安全|性价比|避坑|套餐|预算|服务|方案|能力|优势|功能|特征)$",
+            name,
+        )
+    )
+
+
+def looks_like_generic_category(value: str) -> bool:
+    name = normalize_entity_name(value)
+    if looks_like_home_improvement_attribute(name):
+        return True
+    if looks_like_named_vehicle_brand(name):
+        return False
+    return bool(
+        re.fullmatch(
+            r"(?:[\u4e00-\u9fa5]{0,8})?(?:新能源|豪华|靠谱|推荐|专业|本地|国内|海外|主流|高端)?"
+            r"(?:SUV|MPV|轿车|汽车|电车|车型|品牌|产品|公司|机构|平台|服务商|工具)",
+            name,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def vehicle_brand_base_name(value: str) -> str:
+    name = normalize_entity_name(value)
+    match = re.fullmatch(r"([\u4e00-\u9fa5A-Za-z]{2,12})(?:汽车|电车|SUV|MPV|轿车)", name, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    prefix = match.group(1)
+    if VEHICLE_GENERIC_PREFIX_RE.fullmatch(prefix):
+        return ""
+    if re.fullmatch(r"(?:19|20)\d{2}(?:年)?", prefix):
+        return ""
+    if re.search(r"(?:推荐|选择|哪家|哪个|哪些|哪款|靠谱|主流|品牌|产品|车型|公司|机构|平台|服务)", prefix):
+        return ""
+    return normalize_entity_name(prefix)
+
+
+def looks_like_named_vehicle_brand(value: str) -> bool:
+    return bool(vehicle_brand_base_name(value))
+
+
+def looks_like_product_brand_entity(value: str) -> bool:
+    name = normalize_entity_name(value)
+    if not name or name in PRODUCT_BRAND_NOISE:
+        return False
+    if looks_like_stop_entity(name) or looks_like_entity_attribute(name) or looks_like_service_or_feature(name):
+        return False
+    if looks_like_named_vehicle_brand(name):
+        return True
+    if looks_like_generic_category(name):
+        return False
+    if VEHICLE_MODEL_RE.fullmatch(name):
+        return True
+    if re.fullmatch(r"[\u4e00-\u9fa5]{2,8}", name):
+        return not bool(
+            re.search(
+                r"(?:为了|方便|比较|推荐|选择|追求|看重|适合|如果|此外|尤其|根据|智能|科技|设计|服务|方案|"
+                r"平台|系统|车型|汽车|电车|新能源|豪华|高端|定位|性能|空间|安全|品牌|国产|增程|纯电|插混)",
+                name,
+            )
+        )
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+-]{1,18}", name):
+        return name.upper() not in ENGLISH_ACRONYM_NOISE
+    return False
+
+
+def heuristic_semantic_review(candidate: dict, target_profile: dict, target_aliases: list[str]) -> dict:
+    name = candidate.get("name") or ""
+    target_kind = target_profile.get("entity_type") or "mixed"
+    if target_aliases and matches_target_entity(name, target_aliases):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "target_alias",
+                "is_same_type": True,
+                "is_direct_competitor": False,
+                "confidence": 0.96,
+                "reason": "候选项与目标实体或目标别名匹配。",
+                "normalized_name": name,
+                "recommended_action": "merge_target_alias",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if not candidate_has_answer_evidence(candidate):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "source_or_title",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.74,
+                "reason": "候选项缺少正文回答证据，主要来自信源标题或来源信息。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if re.search(r"(?:上市|认证|认可|资质|授权|备案|批准|持牌|牌照|许可|监管|白名单)", name):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "attribute",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.88,
+                "reason": "候选项更像资质、上市、认证或授权属性，不是实体名称。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if looks_like_service_or_feature(name):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "service_or_feature",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.82,
+                "reason": "候选项更像服务能力、产品功能或内容特征，不是独立竞品实体。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if looks_like_generic_category(name):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "generic_category",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.82,
+                "reason": "候选项是行业、品类或选择口径，不是具体实体名称。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if looks_like_entity_attribute(name):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "attribute",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.86,
+                "reason": "候选项更像资质、上市、认证、地域或通用属性，不是实体名称。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    if candidate.get("kind") not in {"person", "company", "product"} or (
+        target_kind != "mixed" and candidate.get("kind") != target_kind
+    ):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "unrelated_entity",
+                "is_same_type": False,
+                "is_direct_competitor": False,
+                "confidence": 0.74,
+                "reason": "候选项与目标实体类型不一致。",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    surface_score = candidate.get("surface_score", 0)
+    evidence_score = candidate.get("evidence_score", 0)
+    if (
+        candidate.get("is_target")
+        and surface_score >= 3
+        and evidence_score >= required_evidence_score(candidate.get("name", ""), target_kind, surface_score)
+    ):
+        return normalize_semantic_result(
+            {
+                "semantic_label": "direct_competitor",
+                "is_same_type": True,
+                "is_direct_competitor": True,
+                "confidence": max(0.74, float(candidate.get("confidence") or 0)),
+                "reason": "候选项与目标实体类型一致，且有正文证据、实体形态和重复样本支撑。",
+                "recommended_action": "include_competitor",
+            },
+            candidate,
+            "heuristic",
+            False,
+        )
+    return normalize_semantic_result(
+        {
+            "semantic_label": "uncertain",
+            "is_same_type": bool(candidate.get("is_target")),
+            "is_direct_competitor": False,
+            "confidence": 0.5,
+            "reason": "候选项证据不足，建议人工确认。",
+            "recommended_action": "manual_review",
+        },
+        candidate,
+        "heuristic",
+        False,
+    )
+
+
+def extract_openai_response_text(payload: dict) -> str:
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    chunks = []
+    for item in payload.get("output") or []:
+        for content in item.get("content") or []:
+            text = content.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+def call_openai_semantic_review(contexts: list[dict]) -> dict[str, dict]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    model = os.environ.get("YAO_GEO_SEMANTIC_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    system_prompt = (
+        "You classify candidate entities for a DeepSeek GEO report. "
+        "Return strict JSON only. Labels must be one of: "
+        + ", ".join(sorted(SEMANTIC_LABELS))
+        + ". A direct competitor must be the same entity type as the target and a concrete competing person, company, or product. "
+        "Generic categories, attributes, services, source titles, and unrelated entities must not be competitors."
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "return_schema": {
+                            "items": [
+                                {
+                                    "candidate": "string",
+                                    "semantic_label": "target_alias|direct_competitor|generic_category|attribute|service_or_feature|source_or_title|unrelated_entity|uncertain",
+                                    "is_same_type": "boolean",
+                                    "is_direct_competitor": "boolean",
+                                    "confidence": "number 0-1",
+                                    "reason": "short Chinese reason",
+                                    "normalized_name": "string",
+                                    "recommended_action": "include_competitor|merge_target_alias|exclude|manual_review",
+                                }
+                            ]
+                        },
+                        "items": contexts,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "text": {"format": {"type": "json_object"}},
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI semantic review failed: HTTP {exc.code}: {detail[:500]}") from exc
+    data = json.loads(raw)
+    text = extract_openai_response_text(data)
+    parsed = json.loads(text)
+    out = {}
+    for item in parsed.get("items") or []:
+        candidate = clean_text(item.get("candidate"))
+        if candidate:
+            out[candidate] = item
+    return out
+
+
+def apply_semantic_review(
+    args: argparse.Namespace,
+    samples: list[dict],
+    candidates: list[dict],
+    target_profile: dict,
+    target_aliases: list[str],
+    cache_path: Path | None,
+) -> tuple[list[dict], dict]:
+    mode = getattr(args, "semantic_review", "auto") or "auto"
+    threshold = clamp_confidence(getattr(args, "semantic_confidence_threshold", 0.72), 0.72)
+    meta = {
+        "mode": mode,
+        "status": "off" if mode == "off" else "fallback",
+        "source": "none",
+        "confidence_threshold": threshold,
+        "cache_path": str(cache_path) if cache_path else "",
+        "reviewed_count": 0,
+        "error": "",
+    }
+    if mode == "off" or not target_profile.get("has_target"):
+        for candidate in candidates:
+            semantic = normalize_semantic_result(
+                {
+                    "semantic_label": "uncertain",
+                    "is_same_type": bool(candidate.get("is_target")),
+                    "is_direct_competitor": False,
+                    "confidence": 0.0,
+                    "reason": "语义复核已关闭或未指定目标实体。",
+                    "recommended_action": "manual_review",
+                },
+                candidate,
+                "off",
+                False,
+            )
+            candidate["semantic"] = semantic
+        return candidates, meta
+
+    contexts = [build_candidate_context(candidate, samples, target_profile, target_aliases) for candidate in candidates]
+    cache = read_semantic_cache(cache_path)
+    cache_items = cache.setdefault("items", {})
+    ai_results: dict[str, dict] = {}
+    missing_contexts = []
+    missing_candidates = []
+    for candidate, context in zip(candidates, contexts):
+        key = semantic_cache_key(context)
+        cached = cache_items.get(key)
+        if cached and cached.get("candidate") == candidate.get("name"):
+            ai_results[candidate.get("name", "")] = cached
+        else:
+            missing_contexts.append(context)
+            missing_candidates.append(candidate)
+
+    api_key_available = bool(os.environ.get("OPENAI_API_KEY"))
+    if missing_contexts and api_key_available:
+        try:
+            fresh_results: dict[str, dict] = {}
+            for start in range(0, len(missing_contexts), SEMANTIC_REVIEW_BATCH_SIZE):
+                chunk = missing_contexts[start : start + SEMANTIC_REVIEW_BATCH_SIZE]
+                fresh_results.update(call_openai_semantic_review(chunk))
+            missing_ai_names = []
+            for candidate, context in zip(missing_candidates, missing_contexts):
+                raw = fresh_results.get(candidate.get("name", "")) or {}
+                if raw:
+                    normalized = normalize_semantic_result(raw, candidate, "ai", True)
+                    ai_results[candidate.get("name", "")] = normalized
+                    cache_items[semantic_cache_key(context)] = normalized
+                else:
+                    missing_ai_names.append(candidate.get("name", ""))
+            if missing_ai_names and mode == "required":
+                raise RuntimeError(
+                    "Semantic review is required, but AI did not return classifications for: "
+                    + ", ".join(name for name in missing_ai_names if name)
+                )
+            write_semantic_cache(cache_path, cache)
+            if missing_ai_names and len(missing_ai_names) == len(missing_candidates):
+                meta["status"] = "fallback"
+                meta["source"] = "heuristic"
+                meta["error"] = "AI returned no usable semantic classifications; heuristic fallback was used."
+            else:
+                meta["status"] = "ai"
+                meta["source"] = "openai" if not missing_ai_names else "openai+heuristic"
+                if missing_ai_names:
+                    meta["error"] = "Missing AI classifications fell back to heuristic review: " + ", ".join(
+                        name for name in missing_ai_names if name
+                    )
+        except Exception as exc:
+            if mode == "required":
+                raise
+            meta["status"] = "fallback"
+            meta["source"] = "heuristic"
+            meta["error"] = str(exc)
+    elif missing_contexts and mode == "required":
+        raise RuntimeError("Semantic review is required, but OPENAI_API_KEY is not set.")
+    elif ai_results and not missing_contexts:
+        meta["status"] = "cache"
+        meta["source"] = "cache"
+    else:
+        meta["status"] = "fallback"
+        meta["source"] = "heuristic"
+
+    reviewed = []
+    for candidate in candidates:
+        name = candidate.get("name", "")
+        if name in ai_results:
+            semantic = normalize_semantic_result(ai_results[name], candidate, ai_results[name].get("source", "ai"), True)
+        else:
+            semantic = heuristic_semantic_review(candidate, target_profile, target_aliases)
+        candidate = dict(candidate)
+        candidate["semantic"] = semantic
+        candidate["semantic_label"] = semantic["semantic_label"]
+        candidate["semantic_is_same_type"] = semantic["is_same_type"]
+        candidate["semantic_is_direct_competitor"] = semantic["is_direct_competitor"]
+        candidate["semantic_confidence"] = semantic["confidence"]
+        candidate["semantic_reason"] = semantic["reason"]
+        candidate["semantic_source"] = semantic["source"]
+        candidate["semantic_recommended_action"] = semantic["recommended_action"]
+        reviewed.append(candidate)
+    meta["reviewed_count"] = len(reviewed)
+    return reviewed, meta
 
 
 def load_brand_defs(
@@ -708,6 +1323,9 @@ def load_brand_defs(
         entity_candidates = infer_entity_candidates(samples, args.min_inferred_count, args.max_entity_candidates, target_kind)
         target_aliases = merge_target_aliases(target_profile["aliases"], entity_candidates, rows)
         target_profile["aliases"] = target_aliases
+        cache_path = getattr(args, "_semantic_review_cache_path", None)
+        entity_candidates, semantic_review = apply_semantic_review(args, samples, entity_candidates, target_profile, target_aliases, cache_path)
+        target_profile["semantic_review"] = semantic_review
         target_row = [target_profile["entity"], *[alias for alias in target_aliases if alias != target_profile["entity"]]]
         competitor_rows = [
             row
@@ -715,7 +1333,12 @@ def load_brand_defs(
             if row and not any(matches_target_entity(item, target_aliases) for item in row)
         ]
         for candidate in entity_candidates:
-            if not candidate_is_valid_competitor(candidate, target_kind, args.min_inferred_count):
+            if not candidate_is_valid_competitor(
+                candidate,
+                target_kind,
+                args.min_inferred_count,
+                args.semantic_confidence_threshold,
+            ):
                 continue
             names = [candidate["name"], *candidate.get("aliases", [])]
             if any(matches_target_entity(item, target_aliases) for item in names):
@@ -724,6 +1347,8 @@ def load_brand_defs(
         brands = dedupe_brand_rows([target_row, *competitor_rows])
         brands = annotate_entity_roles(brands, target_profile)
         entity_candidates = build_entity_candidates(samples, brands, target_kind, include_discovered=True)
+        entity_candidates, semantic_review = apply_semantic_review(args, samples, entity_candidates, target_profile, target_aliases, cache_path)
+        target_profile["semantic_review"] = semantic_review
         return brands, "target_entity", target_kind, entity_candidates, target_profile
 
     if rows:
@@ -732,10 +1357,11 @@ def load_brand_defs(
         return brands, "provided", target_kind, build_entity_candidates(samples, brands, target_kind, include_discovered=False), profile
 
     entity_candidates = infer_entity_candidates(samples, args.min_inferred_count, args.max_entity_candidates, target_kind)
+    target_profile["semantic_review"] = {"mode": args.semantic_review, "status": "skipped", "source": "none", "confidence_threshold": args.semantic_confidence_threshold, "reviewed_count": 0, "error": ""}
     target_rows = [
         [candidate["name"], *candidate.get("aliases", [])]
         for candidate in entity_candidates
-        if candidate_is_valid_competitor(candidate, target_kind, args.min_inferred_count)
+        if candidate_is_valid_competitor(candidate, target_kind, args.min_inferred_count, args.semantic_confidence_threshold)
     ][: args.max_inferred_brands]
     if target_rows:
         profile = {"entity": "", "aliases": [], "entity_type": target_kind, "entity_type_label": ENTITY_TYPE_LABELS.get(target_kind, target_kind), "has_target": False}
@@ -748,8 +1374,8 @@ def load_brand_defs(
 
 
 def dedupe_brand_rows(rows: list[list[str]]) -> list[dict]:
-    seen: set[str] = set()
     brands = []
+    alias_to_index: dict[str, int] = {}
     for row in rows:
         aliases = []
         for alias in row:
@@ -759,12 +1385,20 @@ def dedupe_brand_rows(rows: list[list[str]]) -> list[dict]:
                 aliases.append(alias)
         if not aliases:
             continue
-        canonical = aliases[0]
-        key = canonical.lower()
-        if key in seen:
+        matched_index = next((alias_to_index[alias.lower()] for alias in aliases if alias.lower() in alias_to_index), None)
+        if matched_index is not None:
+            brand = brands[matched_index]
+            for alias in aliases:
+                key = alias.lower()
+                if key not in {item.lower() for item in brand["aliases"]}:
+                    brand["aliases"].append(alias)
+                alias_to_index[key] = matched_index
             continue
-        seen.add(key)
+        canonical = aliases[0]
         brands.append({"name": canonical, "aliases": aliases})
+        brand_index = len(brands) - 1
+        for alias in aliases:
+            alias_to_index[alias.lower()] = brand_index
     return brands
 
 
@@ -1020,9 +1654,16 @@ def entity_surface_score(value: str, target_kind: str) -> tuple[int, list[str]]:
         elif re.search(r"(?:教育|留学)$", name) and weak_org_prefix_is_clean(name):
             score = max(score, 3)
             reasons.append("品牌化弱后缀")
-    if target_kind in {"product", "mixed"} and re.search(f"(?:{PRODUCT_SUFFIX_WORDS})$", name):
-        score = max(score, 3)
-        reasons.append("产品类后缀")
+    if target_kind in {"product", "mixed"}:
+        if VEHICLE_MODEL_RE.fullmatch(name) and not looks_like_generic_category(name):
+            score = max(score, 4)
+            reasons.append("车型/型号形态")
+        elif target_kind == "product" and looks_like_product_brand_entity(name):
+            score = max(score, 3)
+            reasons.append("产品品牌形态")
+        elif re.search(f"(?:{PRODUCT_SUFFIX_WORDS})$", name):
+            score = max(score, 3)
+            reasons.append("产品类后缀")
     if target_kind in {"person", "mixed"} and looks_like_chinese_person_name(name):
         score = max(score, 4)
         reasons.append("中文姓名形态")
@@ -1048,6 +1689,10 @@ def looks_like_product_entity(value: str) -> bool:
     name = normalize_entity_name(value)
     if looks_like_stop_entity(name):
         return False
+    if VEHICLE_MODEL_RE.fullmatch(name) and not looks_like_generic_category(name):
+        return True
+    if looks_like_product_brand_entity(name):
+        return True
     return bool(re.search(f"(?:{PRODUCT_SUFFIX_WORDS})$", name))
 
 
@@ -1145,6 +1790,10 @@ def classify_entity(row: dict, target_kind: str) -> dict:
     name = row["name"]
     reasons = row["reasons"]
     aliases = row.get("aliases", [])
+    if target_kind == "product":
+        vehicle_base = vehicle_brand_base_name(name)
+        if vehicle_base and vehicle_base.lower() != name.lower() and vehicle_base.lower() not in {alias.lower() for alias in aliases}:
+            aliases.append(vehicle_base)
     kind = "concept"
     confidence = 0.35
     why: list[str] = []
@@ -1160,14 +1809,14 @@ def classify_entity(row: dict, target_kind: str) -> dict:
         kind = "person"
         confidence = 0.72
         why.append("中文姓名且邻近专家职务或来源标题")
-    elif looks_like_product_entity(name):
-        kind = "product"
-        confidence = 0.68
-        why.append("带产品/工具/平台类后缀")
     elif looks_like_org_entity(name):
         kind = "company"
         confidence = 0.68
         why.append("带机构/公司/平台类后缀")
+    elif target_kind in {"product", "mixed"} and looks_like_product_entity(name):
+        kind = "product"
+        confidence = 0.68
+        why.append("带产品/工具/平台类后缀")
     elif aliases and looks_like_chinese_person_name(name):
         kind = "person"
         confidence = 0.68
@@ -1196,11 +1845,12 @@ def classify_entity(row: dict, target_kind: str) -> dict:
     provided_or_metric = bool(reasons.get("provided_or_metric_entity"))
     has_answer_evidence = any(not key.startswith("source_title") for key in reasons)
     is_target = kind in {"person", "company", "product"} if target_kind == "mixed" else kind == target_kind
+    minimum_evidence_score = required_evidence_score(name, target_kind, surface_score)
     if not provided_or_metric and (
         not has_answer_evidence
         or sample_count < 2
         or surface_score < 3
-        or evidence_score < 3.4
+        or evidence_score < minimum_evidence_score
     ):
         is_target = False
     if kind == "noise":
@@ -1838,7 +2488,16 @@ def build_entity_analysis(candidates: list[dict], brand_metrics: dict, target_ki
     for candidate in candidates:
         metric = metrics.get(candidate["name"], {})
         row = dict(candidate)
+        semantic = row.get("semantic") or {}
+        row["semantic_label"] = semantic.get("semantic_label") or row.get("semantic_label") or ""
+        row["semantic_is_same_type"] = semantic.get("is_same_type") if semantic else row.get("semantic_is_same_type", "")
+        row["semantic_is_direct_competitor"] = semantic.get("is_direct_competitor") if semantic else row.get("semantic_is_direct_competitor", "")
+        row["semantic_confidence"] = semantic.get("confidence") if semantic else row.get("semantic_confidence", "")
+        row["semantic_reason"] = semantic.get("reason") or row.get("semantic_reason") or ""
+        row["semantic_source"] = semantic.get("source") or row.get("semantic_source") or ""
+        row["semantic_recommended_action"] = semantic.get("recommended_action") or row.get("semantic_recommended_action") or ""
         row["role"] = metric.get("role") or "candidate"
+        row["entered_competitor_matrix"] = row["role"] == "competitor"
         row["entity_type"] = metric.get("entity_type") or row.get("kind")
         row["metrics"] = {
             "mentioned_samples": metric.get("mentioned_samples", 0),
@@ -1949,6 +2608,14 @@ def compute_summary(
     unique_domains = {ref["domain"] for ref in refs if ref.get("domain")}
     brand_metrics = compute_brand_metrics(samples, brands)
     entity_analysis = build_entity_analysis(entity_candidates, brand_metrics, target_kind, brand_source)
+    semantic_review = target_profile.get("semantic_review") or {
+        "mode": "off",
+        "status": "skipped",
+        "source": "none",
+        "confidence_threshold": 0.72,
+        "reviewed_count": 0,
+        "error": "",
+    }
     channel_counts = Counter(ref["channel"] for ref in refs)
     source_counts = Counter(ref["source"] or ref["domain"] for ref in refs)
     title_stats = title_features(refs, brands)
@@ -1974,6 +2641,8 @@ def compute_summary(
         },
         "target": target_diagnostics,
         "brand_source": brand_source,
+        "semantic_review": semantic_review,
+        "semantic_review_status": semantic_review.get("status"),
         "entities": entity_analysis,
         "brands": brand_metrics,
         "questions": question_metrics(samples, plan_entries),
@@ -2057,6 +2726,7 @@ def structured_export_tables(summary: dict, output_files: dict[str, str]) -> lis
     brands = summary.get("brands", {})
     sources = summary.get("sources", {})
     titles = summary.get("titles", {})
+    semantic_review = summary.get("semantic_review") or {}
     target_metrics = target.get("metrics") or {}
     item_limit = int((summary.get("report") or {}).get("item_limit") or REPORT_ITEM_LIMIT)
 
@@ -2068,6 +2738,10 @@ def structured_export_tables(summary: dict, output_files: dict[str, str]) -> lis
         {"field": "entity_type", "value": target.get("entity_type"), "description": "目标实体类型"},
         {"field": "entity_type_label", "value": target.get("entity_type_label"), "description": "目标实体类型中文"},
         {"field": "brand_source", "value": summary.get("brand_source"), "description": "实体来源口径"},
+        {"field": "semantic_review_mode", "value": semantic_review.get("mode"), "description": "语义复核模式"},
+        {"field": "semantic_review_status", "value": semantic_review.get("status"), "description": "语义复核状态"},
+        {"field": "semantic_review_source", "value": semantic_review.get("source"), "description": "语义复核来源"},
+        {"field": "semantic_confidence_threshold", "value": semantic_review.get("confidence_threshold"), "description": "AI 语义复核竞品准入阈值"},
         {"field": "planned_samples", "value": samples.get("planned"), "description": "计划采样次数"},
         {"field": "completed_samples", "value": samples.get("completed"), "description": "已完成采样次数"},
         {"field": "valid_samples", "value": samples.get("valid"), "description": "有效采样次数"},
@@ -2093,6 +2767,7 @@ def structured_export_tables(summary: dict, output_files: dict[str, str]) -> lis
             ("structured_markdown", output_files.get("structured_markdown", ""), "结构化字段与数据 Markdown"),
             ("structured_excel", output_files.get("structured_excel", ""), "结构化字段与数据 Excel"),
             ("html_report", output_files.get("html_report", ""), "正式可视化诊断分析报告"),
+            ("semantic_review_cache", output_files.get("semantic_review_cache", ""), "语义复核缓存 JSON"),
         ]
     ]
 
@@ -2116,6 +2791,8 @@ def structured_export_tables(summary: dict, output_files: dict[str, str]) -> lis
             item["surface_reasons"] = "、".join(str(value) for value in item["surface_reasons"])
         if isinstance(item.get("reasons"), list):
             item["reasons"] = "、".join(str(value) for value in item["reasons"])
+        if isinstance(item.get("semantic"), dict):
+            item.pop("semantic", None)
         if isinstance(item.get("metrics"), dict):
             for metric_key, metric_value in item.pop("metrics").items():
                 item[f"metric_{metric_key}"] = metric_value
@@ -2140,7 +2817,7 @@ def structured_export_tables(summary: dict, output_files: dict[str, str]) -> lis
         export_table("目标实体指标", target_rows, ["entity", "role", "entity_type", "aliases", "mentioned_samples", "mention_rate", "mention_total", "avg_mentions_per_sample", "avg_mentions_per_mentioned_sample", "top1_samples", "top1_rate", "top3_samples", "top3_rate", "top5_samples", "top5_rate", "average_rank", "dominant_sentiment", "negative_rate", "sentiment_total", "sentiment_counts", "reference_mentions", "reference_domain_count", "reference_url_count"], "目标实体的核心诊断指标。"),
         export_table("同类型实体对比", comparison_rows, ["entity", "role", "entity_type", "aliases", "mentioned_samples", "mention_rate", "mention_total", "avg_mentions_per_sample", "top1_rate", "top3_rate", "top5_rate", "average_rank", "dominant_sentiment", "negative_rate", "reference_mentions", "gap_vs_target_top3", "gap_vs_target_top5"], "目标实体与同类型竞品的指标矩阵。"),
         export_table("问题实体明细", by_question_rows, ["question_id", "question", "entity", "mentioned_samples", "mention_rate", "avg_mentions_per_sample", "top1_rate", "top3_rate", "top5_rate", "average_rank"], "每个问题下各实体的表现。"),
-        export_table("实体识别候选", candidate_rows, ["name", "kind", "role", "entity_type", "is_target", "confidence", "sample_count", "raw_count", "evidence_score", "surface_score", "surface_reasons", "reasons"], "实体识别、清洗、过滤和分类候选。"),
+        export_table("实体识别候选", candidate_rows, ["name", "kind", "role", "entity_type", "is_target", "entered_competitor_matrix", "semantic_label", "semantic_is_same_type", "semantic_is_direct_competitor", "semantic_confidence", "semantic_source", "semantic_recommended_action", "semantic_reason", "confidence", "sample_count", "raw_count", "evidence_score", "surface_score", "surface_reasons", "reasons"], "实体识别、清洗、过滤、语义复核和分类候选。"),
         export_table("信源渠道分布", channel_rows, ["bucket", "raw_bucket", "count", "rate"], "DeepSeek 引用信源的渠道结构。"),
         export_table("来源编号位置", position_rows, ["bucket", "raw_bucket", "count", "rate"], "DeepSeek source panel 编号位置分布。"),
         export_table("高频域名", sources.get("top_domains", []), ["display_name", "name", "count", "url"], "高频引用域名。"),
@@ -3205,6 +3882,24 @@ def render_report(title: str, input_name: str, summary: dict) -> str:
     item_limit = int((summary.get("report") or {}).get("item_limit") or REPORT_ITEM_LIMIT)
     target = summary.get("target", {})
     target_metrics = target.get("metrics") or {}
+    semantic_review = summary.get("semantic_review") or {}
+    semantic_status_text = {
+        "off": "已关闭",
+        "ai": "AI 复核",
+        "cache": "缓存复核",
+        "fallback": "规则回退",
+        "skipped": "未执行",
+    }.get(semantic_review.get("status"), semantic_review.get("status") or "未执行")
+    semantic_label_text = {
+        "target_alias": "目标别名",
+        "direct_competitor": "直接竞品",
+        "generic_category": "泛品类词",
+        "attribute": "属性词",
+        "service_or_feature": "服务/特征",
+        "source_or_title": "信源/标题",
+        "unrelated_entity": "无关实体",
+        "uncertain": "待确认",
+    }
     brand_source_note = {
         "provided": "用户提供实体表",
         "target_entity": "围绕目标实体识别同类型竞品",
@@ -3342,11 +4037,14 @@ def render_report(title: str, input_name: str, summary: dict) -> str:
         for row in comparison_rows
     )
     entity_table = "".join(
-        f"<tr><td>{esc(row['name'])}</td><td>{esc(row['kind'])}</td><td>{esc({'target': '目标', 'competitor': '竞品', 'candidate': '候选'}.get(row.get('role'), row.get('role')))}</td>"
-        f"<td>{'是' if row.get('is_target') else '否'}</td><td>{pct(row.get('confidence') or 0)}</td>"
+        f"<tr><td>{esc(row['name'])}</td><td>{esc(row['kind'])}</td>"
+        f"<td>{esc(semantic_label_text.get(row.get('semantic_label'), row.get('semantic_label') or '待确认'))}</td>"
+        f"<td>{'是' if row.get('semantic_is_same_type') else '否'}</td>"
+        f"<td>{'是' if row.get('entered_competitor_matrix') else '否'}</td>"
+        f"<td>{pct(row.get('semantic_confidence') or 0)}</td>"
         f"<td>{row.get('sample_count', 0)}</td><td>{pct(row.get('metrics', {}).get('mention_rate') or 0)}</td>"
         f"<td>{pct(row.get('metrics', {}).get('top3_rate') or 0)}</td><td>{pct(row.get('metrics', {}).get('top5_rate') or 0)}</td>"
-        f"<td>{esc('；'.join(row.get('reasons') or ['候选项']))}</td></tr>"
+        f"<td>{esc(row.get('semantic_reason') or '；'.join(row.get('reasons') or ['候选项']))}</td></tr>"
         for row in summary.get("entities", {}).get("candidates", [])[:item_limit]
     )
     title_table = "".join(
@@ -3704,9 +4402,9 @@ p { margin:0 0 12px; color:var(--olive); }
 
 	  <section class="section" id="entities">
 	    <h2><span class="lang-zh">目标实体识别</span><span class="lang-en">Entity Identification</span></h2>
-	    <p class="entity-note">目标类型：{esc(entity_kind_label)}。系统会把人、公司、产品、概念词和噪声词分开；只有同类型候选项会进入目标与竞品概率计算。自动识别是启发式判断，正式报告仍建议提供实体别名表校准。</p>
+	    <p class="entity-note">目标类型：{esc(entity_kind_label)}。语义复核状态：{esc(semantic_status_text)}。系统会把人、公司、产品、概念词和噪声词分开；只有同类型候选项会进入目标与竞品概率计算。自动识别是启发式判断，正式报告建议提供实体别名表并开启 required 语义复核。</p>
 	    <table class="kami-table">
-	      <thead><tr><th>候选项</th><th>类型</th><th>角色</th><th>同类型</th><th>置信度</th><th>样本数</th><th>提及率</th><th>Top 3</th><th>Top 5</th><th>判断依据</th></tr></thead>
+	      <thead><tr><th>候选项</th><th>规则类型</th><th>语义标签</th><th>同类型</th><th>进入竞品</th><th>语义置信度</th><th>样本数</th><th>提及率</th><th>Top 3</th><th>Top 5</th><th>判定理由</th></tr></thead>
 	      <tbody>{entity_table}</tbody>
 	    </table>
 	  </section>
@@ -3861,12 +4559,18 @@ def main() -> None:
     data = read_json(input_path)
     samples = normalize_samples(data)
     plan_entries = normalize_plan(data, samples)
+    args.semantic_confidence_threshold = clamp_confidence(args.semantic_confidence_threshold, 0.72)
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else input_path.parent / "report"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args._semantic_review_cache_path = (
+        Path(args.semantic_review_cache).resolve()
+        if args.semantic_review_cache
+        else out_dir / "semantic-review-cache.json"
+    )
     brands, brand_source, target_kind, entity_candidates, target_profile = load_brand_defs(args, data, samples)
     item_limit = max(1, min(int(args.max_report_items or REPORT_ITEM_LIMIT), 50))
     summary = compute_summary(samples, brands, brand_source, plan_entries, target_kind, entity_candidates, target_profile, item_limit)
     summary["input_file"] = input_path.name
-    out_dir = Path(args.out_dir).resolve() if args.out_dir else input_path.parent / "report"
-    out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"
     markdown_path = out_dir / "structured-data.md"
     excel_path = out_dir / "structured-data.xlsx"
@@ -3878,6 +4582,7 @@ def main() -> None:
         "structured_markdown": str(markdown_path),
         "structured_excel": str(excel_path),
         "html_report": str(report_path),
+        "semantic_review_cache": str(args._semantic_review_cache_path),
     }
     export_tables = structured_export_tables(summary, output_files)
     write_structured_markdown(markdown_path, summary, export_tables)

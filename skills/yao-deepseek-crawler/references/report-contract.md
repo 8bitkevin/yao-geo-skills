@@ -40,8 +40,9 @@ Stage 2 writes these analysis artifacts in the selected report directory:
 - `structured-data.md`: Markdown export of cleaned fields and data tables.
 - `structured-data.xlsx`: Excel workbook with the same structured tables as the Markdown export.
 - `report.html`: Kami-styled visual diagnosis and analysis report.
+- `semantic-review-cache.json`: optional AI semantic-review cache, written when AI review produces reusable candidate classifications.
 
-The structured Markdown and Excel workbook must be generated from the same summary object as the HTML report. They should include output file paths, overview fields, question coverage, target metrics, same-type entity comparison, question-by-entity metrics, entity recognition candidates, source/channel tables, frequent domains/sources/URLs/titles, title-feature buckets, and other cleaned fields that feed the visible report. The raw crawl JSON remains the audit source of truth; the structured exports are analysis-stage derivatives.
+The structured Markdown and Excel workbook must be generated from the same summary object as the HTML report. They should include output file paths, overview fields, semantic review status, question coverage, target metrics, same-type entity comparison, question-by-entity metrics, entity recognition candidates, AI semantic labels and reasons, source/channel tables, frequent domains/sources/URLs/titles, title-feature buckets, and other cleaned fields that feed the visible report. The raw crawl JSON remains the audit source of truth; the structured exports are analysis-stage derivatives.
 
 ## Metric Definitions
 
@@ -87,6 +88,40 @@ Entity recognition uses a local hybrid NER gate:
 4. Score entity surface quality separately from evidence quality. Strong legal/organization suffixes score higher than weak suffixes such as `教育` or `留学`; weak suffixes require a clean brand-like prefix.
 5. Inferred competitors must pass type consistency, minimum repeated-sample count, answer-body evidence, surface score, and evidence score gates. Source-title-only names remain in source/title analysis but do not create competitor rows.
 6. Keep regression examples for both false positives and false negatives in `scripts/test_entity_recognition.py`.
+
+When a target entity is supplied, the analyzer can add AI semantic review after local candidate recall. Semantic review is optional and does not replace raw logs or hard-rule evidence.
+
+Semantic review modes:
+
+- `--semantic-review auto`: default. Use AI when `OPENAI_API_KEY` is available; otherwise fall back to local rules and write `semantic_review_status: fallback`.
+- `--semantic-review required`: fail analysis if AI review is unavailable, incomplete, or invalid. Use this for formal report delivery.
+- `--semantic-review off`: skip AI review and use local rules only.
+- `--semantic-confidence-threshold`: default `0.72`.
+- `--semantic-review-cache`: default `<out-dir>/semantic-review-cache.json`.
+
+Semantic labels are fixed:
+
+- `target_alias`
+- `direct_competitor`
+- `generic_category`
+- `attribute`
+- `service_or_feature`
+- `source_or_title`
+- `unrelated_entity`
+- `uncertain`
+
+AI review receives a candidate context containing the target entity, target aliases, declared entity type, keywords, candidate name, candidate aliases, rule classification, sample count, evidence counters, evidence scores, and answer-body snippets. It must return strict JSON with label, same-type flag, direct-competitor flag, confidence, normalized name, recommended action, and a short reason.
+
+Competitors may enter metric calculation only when all of these are true:
+
+- the local rule layer does not mark the candidate as noise, generic category, attribute, service/feature, or source/title-only
+- the candidate is a concrete `person`, `company`, or `product`
+- the candidate type matches the target entity type
+- the candidate has answer-body evidence, not only source-title evidence
+- sample count and local surface/evidence scores pass the local gates
+- if AI review is enforced, the AI label is `direct_competitor`, `is_same_type = true`, `is_direct_competitor = true`, and `confidence >= 0.72`
+
+`summary.json`, `structured-data.md`, `structured-data.xlsx`, and the HTML entity-recognition table must expose semantic review status plus these candidate fields: AI semantic label, same-type flag, direct-competitor flag, whether the candidate entered the competitor matrix, semantic confidence, source (`ai`, `cache`, `heuristic`, or `off`), recommended action, and reason. Excluded candidates and reasons must remain visible for audit.
 
 Standard target type is controlled by `--entity-type`:
 

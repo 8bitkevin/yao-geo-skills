@@ -175,6 +175,86 @@ def main() -> None:
     for value in ["西安装修公司", "2026西安主流装修公司", "西安口碑装修公司"]:
         assert value not in decor_candidates, f"generic category leaked as competitor: {value}"
 
+    target_profile = {
+        "entity": "西安壹号设计",
+        "aliases": ["西安壹号设计", "壹号设计"],
+        "entity_type": "company",
+        "has_target": True,
+    }
+    target_aliases = target_profile["aliases"]
+    semantic_expectations = [
+        (
+            {
+                "name": "西安城市人家装饰",
+                "kind": "company",
+                "is_target": True,
+                "confidence": 0.84,
+                "sample_count": 2,
+                "raw_count": 2,
+                "evidence": {"org_suffix": 2},
+                "surface_score": 4,
+                "evidence_score": 3.8,
+            },
+            "direct_competitor",
+        ),
+        (
+            {
+                "name": "西安青马设计",
+                "kind": "company",
+                "is_target": True,
+                "confidence": 0.84,
+                "sample_count": 2,
+                "raw_count": 2,
+                "evidence": {"org_suffix": 2},
+                "surface_score": 4,
+                "evidence_score": 3.8,
+            },
+            "direct_competitor",
+        ),
+        (
+            {"name": "西安装修公司", "kind": "company", "is_target": False, "sample_count": 2, "evidence": {"org_suffix": 2}},
+            "generic_category",
+        ),
+        (
+            {"name": "全案设计", "kind": "concept", "is_target": False, "sample_count": 2, "evidence": {"org_suffix": 2}},
+            "service_or_feature",
+        ),
+        (
+            {"name": "A股上市集团", "kind": "noise", "is_target": False, "sample_count": 2, "evidence": {"answer_heading": 2}},
+            "attribute",
+        ),
+        (
+            {"name": "教育部首批认证机构", "kind": "noise", "is_target": False, "sample_count": 2, "evidence": {"answer_heading": 2}},
+            "attribute",
+        ),
+    ]
+    for candidate, expected_label in semantic_expectations:
+        reviewed = analyzer.heuristic_semantic_review(candidate, target_profile, target_aliases)
+        assert reviewed["semantic_label"] == expected_label, reviewed
+
+    product_profile = {"entity": "蔚来", "aliases": ["蔚来", "NIO"], "entity_type": "product", "has_target": True}
+    product_rows = {}
+    for sample_id in ["p01", "p02"]:
+        analyzer.add_entity_candidate(product_rows, "理想L9", sample_id, "answer_heading")
+        analyzer.add_entity_candidate(product_rows, "问界M9", sample_id, "answer_heading")
+        analyzer.add_entity_candidate(product_rows, "理想汽车", sample_id, "answer_heading")
+        analyzer.add_entity_candidate(product_rows, "小鹏汽车", sample_id, "answer_heading")
+    for value in ["理想L9", "问界M9", "理想汽车", "小鹏汽车"]:
+        candidate = analyzer.classify_entity(product_rows[value], "product")
+        reviewed = analyzer.heuristic_semantic_review(candidate, product_profile, product_profile["aliases"])
+        assert reviewed["semantic_label"] == "direct_competitor", reviewed
+    assert analyzer.vehicle_brand_base_name("理想汽车") == "理想"
+    merged_vehicle_rows = analyzer.dedupe_brand_rows([["小米"], ["小米汽车", "小米"]])
+    assert len(merged_vehicle_rows) == 1 and "小米汽车" in merged_vehicle_rows[0]["aliases"], merged_vehicle_rows
+    generic_product = {"name": "豪华SUV", "kind": "concept", "is_target": False, "sample_count": 2, "evidence": {"answer_heading": 2}}
+    assert analyzer.heuristic_semantic_review(generic_product, product_profile, product_profile["aliases"])["semantic_label"] == "generic_category"
+    generic_nev = {"name": "新能源汽车", "kind": "concept", "is_target": False, "sample_count": 2, "evidence": {"answer_heading": 2}}
+    assert analyzer.heuristic_semantic_review(generic_nev, product_profile, product_profile["aliases"])["semantic_label"] == "generic_category"
+
+    person_profile = {"entity": "姚金刚", "aliases": ["姚金刚"], "entity_type": "person", "has_target": True}
+    company_candidate = {"name": "启德教育", "kind": "company", "is_target": False, "sample_count": 2, "evidence": {"org_suffix": 2}}
+    assert analyzer.heuristic_semantic_review(company_candidate, person_profile, person_profile["aliases"])["semantic_label"] == "unrelated_entity"
+
     one_off_fragment_rows = {}
     analyzer.add_entity_candidate(one_off_fragment_rows, "英国罗素集团", "s01", "org_suffix")
     one_off_fragment = analyzer.classify_entity(one_off_fragment_rows["英国罗素集团"], "company")
